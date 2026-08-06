@@ -1,24 +1,26 @@
 """
-AgentGuard unified OpenAI test.
+Unified AgentGuard + Anthropic Claude SDK test suite.
 
 Uses:
     agentguard.init()
     agentguard.policy()
     agentguard.flush()
 
-Fixes:
-    Tenant/User shown as "unknown"
+Does not use:
+    agentguard.get_client()
+    AgentGuardClient
+    Langfuse client imports
 
 Tests:
 - Observability
 - Prompt creation
 - Prompt versioning
-- Prompt dataset
+- Prompt datasets
 - Score storage/retrieval
 - LLM-as-a-Judge
 - Five evaluator criteria
-- Human-review queue
-- Dataset experiment
+- Human review queue
+- Datasets and experiments
 """
 
 import json
@@ -31,15 +33,14 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
 import httpx
-import openai
+import anthropic
 from dotenv import load_dotenv
 
+# Environment must be loaded before AgentGuard initialization.
 load_dotenv(override=True)
 
-os.environ.setdefault(
-    "AGENTGUARD_CAPTURE_CONTENT",
-    "true",
-)
+# Allows AgentGuard to capture request/response content.
+os.environ.setdefault("AGENTGUARD_CAPTURE_CONTENT", "true")
 
 import agentguard
 from opentelemetry import trace
@@ -50,55 +51,32 @@ from opentelemetry.trace import Status, StatusCode
 # Configuration
 # ============================================================
 
-BASE_URL = os.getenv(
-    "AGENTGUARD_BASE_URL",
-    "",
-).rstrip("/")
-
+BASE_URL = os.getenv("AGENTGUARD_BASE_URL", "").rstrip("/")
 PUBLIC_KEY = os.getenv("AGENTGUARD_PUBLIC_KEY")
 SECRET_KEY = os.getenv("AGENTGUARD_SECRET_KEY")
 PROJECT_ID = os.getenv("AGENTGUARD_PROJECT_ID")
-
 ENVIRONMENT = os.getenv(
     "AGENTGUARD_ENVIRONMENT",
     "production",
 )
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 MODEL = os.getenv(
-    "EVALUATION_TEST_MODEL",
-    "gpt-4o-mini",
+    "CLAUDE_TEST_MODEL",
+    "claude-sonnet-5",
 )
 
 MODEL_1 = os.getenv(
-    "TEST_MODEL_1",
-    "gpt-4o-mini",
+    "CLAUDE_TEST_MODEL_1",
+    "claude-haiku-4-5",
 )
-
 MODEL_2 = os.getenv(
-    "TEST_MODEL_2",
-    "gpt-4.1-mini",
+    "CLAUDE_TEST_MODEL_2",
+    "claude-sonnet-5",
 )
-
 MODEL_3 = os.getenv(
-    "TEST_MODEL_3",
-    "gpt-4.1-nano",
-)
-
-TENANT_ID = os.getenv(
-    "AGENTGUARD_TENANT_ID",
-    "test-evals",
-)
-
-TENANT_NAME = os.getenv(
-    "AGENTGUARD_TENANT_NAME",
-    TENANT_ID,
-)
-
-PROJECT_NAME = os.getenv(
-    "AGENTGUARD_PROJECT_NAME",
-    "test-evals",
+    "CLAUDE_TEST_MODEL_3",
+    "claude-opus-5",
 )
 
 HTTP_TIMEOUT = float(
@@ -114,33 +92,20 @@ POLL_INTERVAL = float(
 )
 
 RUN_ID = (
-    f"openai-"
     f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-"
     f"{uuid.uuid4().hex[:8]}"
 )
 
 SHORT_ID = uuid.uuid4().hex[:8]
 SESSION_ID = f"session-{RUN_ID}"
+DEFAULT_TENANT = "agentguard-combined-test"
 
-PROMPT_CREATION_NAME = (
-    f"prompt-create-{RUN_ID}"
-)
+PROMPT_CREATION_NAME = f"prompt-create-{RUN_ID}"
+PROMPT_VERSION_NAME = f"prompt-version-{RUN_ID}"
+PROMPT_DATASET_NAME = f"prompt-dataset-{RUN_ID}"
 
-PROMPT_VERSION_NAME = (
-    f"prompt-version-{RUN_ID}"
-)
-
-PROMPT_DATASET_NAME = (
-    f"prompt-dataset-{RUN_ID}"
-)
-
-EVALUATION_DATASET_NAME = (
-    f"evaluation-dataset-{RUN_ID}"
-)
-
-EXPERIMENT_NAME = (
-    f"evaluation-run-{RUN_ID}"
-)
+EVALUATION_DATASET_NAME = f"evaluation-dataset-{RUN_ID}"
+EXPERIMENT_NAME = f"evaluation-run-{RUN_ID}"
 
 TEST_RESULTS: List[Dict[str, Any]] = []
 
@@ -154,8 +119,7 @@ def validate_environment() -> None:
         "AGENTGUARD_BASE_URL": BASE_URL,
         "AGENTGUARD_PUBLIC_KEY": PUBLIC_KEY,
         "AGENTGUARD_SECRET_KEY": SECRET_KEY,
-        "AGENTGUARD_PROJECT_ID": PROJECT_ID,
-        "OPENAI_API_KEY": OPENAI_API_KEY,
+        "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY,
     }
 
     missing = [
@@ -166,7 +130,7 @@ def validate_environment() -> None:
 
     if missing:
         raise RuntimeError(
-            "Missing environment variables: "
+            "Missing required environment variables: "
             + ", ".join(missing)
         )
 
@@ -175,7 +139,7 @@ validate_environment()
 
 
 # ============================================================
-# AgentGuard initialization
+# AgentGuard unified initialization
 # ============================================================
 
 agentguard.init(
@@ -186,9 +150,6 @@ agentguard.init(
     model=MODEL,
     environment=ENVIRONMENT,
     guardrails="auto",
-    on_block="raise",
-    tracing="batch",
-    fail="closed",
     streaming="chunk",
 )
 
@@ -197,8 +158,8 @@ agentguard.init(
 # Clients
 # ============================================================
 
-openai_client = openai.OpenAI(
-    api_key=OPENAI_API_KEY,
+claude_client = anthropic.Anthropic(
+    api_key=ANTHROPIC_API_KEY,
 )
 
 rest_client = httpx.Client(
@@ -215,12 +176,12 @@ rest_client = httpx.Client(
 )
 
 tracer = trace.get_tracer(
-    "agentguard-openai-test-evals"
+    "agentguard-unified-claude-test"
 )
 
 
 # ============================================================
-# Common helpers
+# Test helpers
 # ============================================================
 
 class SkipTest(Exception):
@@ -234,10 +195,7 @@ def section(title: str) -> None:
     print("=" * 76)
 
 
-def check(
-    condition: bool,
-    message: str,
-) -> None:
+def check(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
 
@@ -249,15 +207,11 @@ def check_equal(
 ) -> None:
     if actual != expected:
         raise AssertionError(
-            f"{message}. "
-            f"Expected {expected!r}, got {actual!r}"
+            f"{message}. Expected {expected!r}, got {actual!r}"
         )
 
 
-def check_score(
-    value: Any,
-    name: str,
-) -> None:
+def check_score(value: Any, name: str) -> None:
     check(
         isinstance(value, (int, float)),
         f"{name} must be numeric",
@@ -280,136 +234,46 @@ def utc_now() -> str:
     )
 
 
-def tenant_metadata(
-    *,
-    test_case: str,
-    feature: str,
-    tenant: str,
-    model: Optional[str] = None,
-    extra: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    return {
-        "tenant": tenant,
-        "tenantId": tenant,
-        "tenantName": TENANT_NAME,
-        "projectId": PROJECT_ID,
-        "projectName": PROJECT_NAME,
-        "testCase": test_case,
-        "testRunId": RUN_ID,
-        "feature": feature,
-        "model": model or MODEL,
-        "provider": "openai",
-        "environment": ENVIRONMENT,
-        "sdk": "openai",
-        **(extra or {}),
-    }
-
-
-def policy_context(
+def policy(
     test_case: str,
     feature: str,
     *,
-    tenant: str = TENANT_ID,
+    tenant: str = DEFAULT_TENANT,
     model: Optional[str] = None,
     extra_metadata: Optional[Dict[str, Any]] = None,
 ):
+    """
+    Create the AgentGuard policy used by this controlled test suite.
+    """
+
+    selected_model = model or MODEL
+
     return agentguard.policy(
-        disable=["prompt-injection", "toxic-content"],
+        disable=[
+            "prompt-injection",
+            "toxic-content",
+        ],
+        fail="closed",
+        on_block="raise",
+        streaming="chunk",
         user_id=tenant,
-        session_id=f"session-{test_case}",
+        session_id=SESSION_ID,
         feature=feature,
         metadata={
             "tenant": tenant,
-            "test_case": test_case,
-            "sdk": "openai",
+            "testCase": test_case,
+            "testRunId": RUN_ID,
+            "model": selected_model,
+            "environment": ENVIRONMENT,
+            "sdk": "anthropic",
+            "apiStyle": "agentguard-init-policy",
             **(extra_metadata or {}),
         },
     )
 
 
-def set_span_identity(
-    span,
-    *,
-    tenant: str,
-    test_case: str,
-    feature: str,
-) -> None:
-    """
-    Manual OpenTelemetry spans do not automatically inherit
-    AgentGuard policy identity, so set the attributes explicitly.
-    """
-
-    # Recognized user/tenant attributes
-    span.set_attribute(
-        "user.id",
-        tenant,
-    )
-
-    span.set_attribute(
-        "langfuse.user.id",
-        tenant,
-    )
-
-    # Recognized session attributes
-    span.set_attribute(
-        "session.id",
-        SESSION_ID,
-    )
-
-    span.set_attribute(
-        "langfuse.session.id",
-        SESSION_ID,
-    )
-
-    # Trace metadata
-    span.set_attribute(
-        "langfuse.trace.metadata.tenant",
-        tenant,
-    )
-
-    span.set_attribute(
-        "langfuse.trace.metadata.tenantId",
-        tenant,
-    )
-
-    span.set_attribute(
-        "langfuse.trace.metadata.tenantName",
-        TENANT_NAME,
-    )
-
-    span.set_attribute(
-        "langfuse.trace.metadata.projectId",
-        PROJECT_ID,
-    )
-
-    span.set_attribute(
-        "langfuse.trace.metadata.projectName",
-        PROJECT_NAME,
-    )
-
-    span.set_attribute(
-        "langfuse.trace.metadata.testCase",
-        test_case,
-    )
-
-    span.set_attribute(
-        "langfuse.trace.metadata.testRunId",
-        RUN_ID,
-    )
-
-    span.set_attribute(
-        "langfuse.trace.metadata.feature",
-        feature,
-    )
-
-    span.set_attribute(
-        "langfuse.trace.tags",
-        [
-            f"tenant:{tenant}",
-            f"feature:{feature}",
-            f"project:{PROJECT_NAME}",
-        ],
-    )
+def flush() -> None:
+    agentguard.flush()
 
 
 def run_test(
@@ -494,9 +358,7 @@ def rest(
         ) from error
 
 
-def unwrap_object(
-    response: Any,
-) -> Dict[str, Any]:
+def unwrap_object(response: Any) -> Dict[str, Any]:
     if not isinstance(response, dict):
         return {}
 
@@ -508,9 +370,7 @@ def unwrap_object(
     return response
 
 
-def unwrap_list(
-    response: Any,
-) -> List[Dict[str, Any]]:
+def unwrap_list(response: Any) -> List[Dict[str, Any]]:
     if isinstance(response, list):
         return response
 
@@ -552,9 +412,7 @@ def unwrap_list(
     return []
 
 
-def response_id(
-    response: Any,
-) -> Optional[str]:
+def response_id(response: Any) -> Optional[str]:
     data = unwrap_object(response)
 
     for key in (
@@ -576,11 +434,11 @@ def response_id(
 
 
 # ============================================================
-# Connection
+# Connection test
 # ============================================================
 
 def verify_connection() -> None:
-    with policy_context(
+    with policy(
         "connection-check",
         "setup",
     ):
@@ -599,69 +457,135 @@ def verify_connection() -> None:
         "AgentGuard returned an invalid response",
     )
 
-    print("AgentGuard connected")
-    print("Organization :", "Agent Guard Org")
-    print("Project      :", PROJECT_NAME)
-    print("Project ID   :", PROJECT_ID)
-    print("Tenant ID    :", TENANT_ID)
-    print("Tenant name  :", TENANT_NAME)
+    print("AgentGuard connection successful")
+    print("Base URL   :", BASE_URL)
+    print("Project ID :", PROJECT_ID or "derived from API key")
+    print("Environment:", ENVIRONMENT)
 
 
 # ============================================================
-# OpenAI helpers
+# Anthropic Claude calls
 # ============================================================
 
-def call_openai(
+def response_text(response: Any) -> str:
+    parts = [
+        block.text
+        for block in response.content
+        if getattr(block, "type", None) == "text"
+        and getattr(block, "text", None)
+    ]
+
+    return "".join(parts).strip()
+
+
+def call_claude(
     prompt: str,
     *,
     system: Optional[str] = None,
     max_tokens: int = 150,
     model: Optional[str] = None,
-    test_case: str = "openai-request",
-    feature: str = "openai-request",
-    tenant: str = TENANT_ID,
+    test_case: str = "claude-request",
+    feature: str = "claude-request",
+    tenant: str = DEFAULT_TENANT,
     policy_metadata: Optional[Dict[str, Any]] = None,
 ) -> str:
     selected_model = model or MODEL
-    messages = []
+
+    request: Dict[str, Any] = {
+        "model": selected_model,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        "temperature": 0,
+        "max_tokens": max_tokens,
+    }
 
     if system:
-        messages.append(
-            {
-                "role": "system",
-                "content": system,
-            }
-        )
+        request["system"] = system
 
-    messages.append(
-        {
-            "role": "user",
-            "content": prompt,
-        }
-    )
-
-    with policy_context(
+    with policy(
         test_case,
         feature,
         tenant=tenant,
         model=selected_model,
         extra_metadata=policy_metadata,
     ):
-        response = openai_client.chat.completions.create(
-            model=selected_model,
-            messages=messages,
-            temperature=0,
-            max_completion_tokens=max_tokens,
-        )
+        response = claude_client.messages.create(**request)
 
-    content = response.choices[0].message.content
+    content = response_text(response)
 
-    check(
-        content,
-        "OpenAI returned an empty response",
-    )
+    check(content, "Claude returned an empty response")
 
-    return content.strip()
+    return content
+
+
+def score_reason_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "score": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+            },
+            "reason": {
+                "type": "string",
+            },
+        },
+        "required": [
+            "score",
+            "reason",
+        ],
+        "additionalProperties": False,
+    }
+
+
+def judge_response_schema(
+    data: Dict[str, Any],
+) -> Dict[str, Any]:
+    if (
+        "goodAnswer" in data
+        and "badAnswer" in data
+    ):
+        return {
+            "type": "object",
+            "properties": {
+                "good": score_reason_schema(),
+                "bad": score_reason_schema(),
+            },
+            "required": [
+                "good",
+                "bad",
+            ],
+            "additionalProperties": False,
+        }
+
+    if "criteria" in data:
+        criteria = data["criteria"]
+
+        return {
+            "type": "object",
+            "properties": {
+                "evaluations": {
+                    "type": "object",
+                    "properties": {
+                        name: score_reason_schema()
+                        for name in criteria
+                    },
+                    "required": list(criteria.keys()),
+                    "additionalProperties": False,
+                },
+            },
+            "required": [
+                "evaluations",
+            ],
+            "additionalProperties": False,
+        }
+
+    return score_reason_schema()
 
 
 def call_json_judge(
@@ -670,25 +594,21 @@ def call_json_judge(
     *,
     test_case: str,
     feature: str,
-    tenant: str = TENANT_ID,
 ) -> Dict[str, Any]:
-    with policy_context(
+    with policy(
         test_case,
         feature,
-        tenant=tenant,
+        model=MODEL,
         extra_metadata={
             "evaluation": True,
-            "judgeProvider": "openai",
+            "judgeProvider": "anthropic",
             "judgeModel": MODEL,
         },
     ):
-        response = openai_client.chat.completions.create(
+        response = claude_client.messages.create(
             model=MODEL,
+            system=system_prompt,
             messages=[
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
                 {
                     "role": "user",
                     "content": json.dumps(
@@ -697,19 +617,19 @@ def call_json_judge(
                     ),
                 },
             ],
-            response_format={
-                "type": "json_object",
+            output_config={
+                "format": {
+                    "type": "json_schema",
+                    "schema": judge_response_schema(data),
+                },
             },
             temperature=0,
-            max_completion_tokens=900,
+            max_tokens=900,
         )
 
-    content = response.choices[0].message.content
+    content = response_text(response)
 
-    check(
-        content,
-        "Judge returned an empty response",
-    )
+    check(content, "Judge returned an empty response")
 
     try:
         result = json.loads(content)
@@ -727,7 +647,7 @@ def call_json_judge(
 
 
 # ============================================================
-# Explicit trace helper
+# Trace and observation helpers
 # ============================================================
 
 def create_trace(
@@ -737,7 +657,7 @@ def create_trace(
     *,
     test_case: str,
     feature: str,
-    tenant: str = TENANT_ID,
+    tenant: str = DEFAULT_TENANT,
     level: str = "DEFAULT",
     status_message: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
@@ -745,51 +665,35 @@ def create_trace(
     trace_id = str(uuid.uuid4())
     observation_id = str(uuid.uuid4())
 
-    complete_metadata = tenant_metadata(
-        test_case=test_case,
-        feature=feature,
-        tenant=tenant,
-        extra=metadata,
-    )
-
     trace_body: Dict[str, Any] = {
         "id": trace_id,
         "name": name,
         "input": input_data,
         "output": output_data,
-
-        # These fields fix Tenant/User = unknown
+        "environment": ENVIRONMENT,
         "userId": tenant,
         "sessionId": SESSION_ID,
-
-        "environment": ENVIRONMENT,
         "level": level,
-        "metadata": complete_metadata,
+        "metadata": {
+            "testRunId": RUN_ID,
+            "testCase": test_case,
+            "feature": feature,
+            "tenant": tenant,
+            "provider": "anthropic",
+            "model": MODEL,
+            "apiStyle": "agentguard-init-policy",
+            **(metadata or {}),
+        },
     }
 
     if status_message:
         trace_body["statusMessage"] = status_message
 
-    observation_body: Dict[str, Any] = {
-        "id": observation_id,
-        "traceId": trace_id,
-        "name": f"{name}-observation",
-        "input": input_data,
-        "output": output_data,
-        "level": level,
-        "metadata": complete_metadata,
-    }
-
-    if status_message:
-        observation_body["statusMessage"] = (
-            status_message
-        )
-
-    with policy_context(
+    with policy(
         test_case,
         feature,
         tenant=tenant,
-        extra_metadata=complete_metadata,
+        extra_metadata=metadata,
     ):
         rest(
             "POST",
@@ -797,6 +701,26 @@ def create_trace(
             expected=(200, 201),
             body=trace_body,
         )
+
+        observation_body: Dict[str, Any] = {
+            "id": observation_id,
+            "traceId": trace_id,
+            "name": f"{name}-observation",
+            "input": input_data,
+            "output": output_data,
+            "level": level,
+            "metadata": {
+                "testRunId": RUN_ID,
+                "testCase": test_case,
+                "feature": feature,
+                "provider": "anthropic",
+                "model": MODEL,
+                **(metadata or {}),
+            },
+        }
+
+        if status_message:
+            observation_body["statusMessage"] = status_message
 
         rest(
             "POST",
@@ -811,16 +735,11 @@ def create_trace(
     }
 
 
-# ============================================================
-# Manual OpenTelemetry span helper
-# ============================================================
-
 def create_synthetic_span(
     name: str,
     *,
     feature: str,
-    tenant: str = TENANT_ID,
-    model: Optional[str] = None,
+    tenant: str,
     input_tokens: int = 0,
     output_tokens: int = 0,
     duration: float = 0,
@@ -829,60 +748,52 @@ def create_synthetic_span(
     tool_arguments: Optional[str] = None,
     tool_result: Optional[str] = None,
 ) -> None:
-    selected_model = model or MODEL
-
-    with policy_context(
+    with policy(
         name,
         feature,
         tenant=tenant,
-        model=selected_model,
     ):
         with tracer.start_as_current_span(name) as span:
-            set_span_identity(
-                span,
-                tenant=tenant,
-                test_case=name,
-                feature=feature,
-            )
-
-            span.set_attribute(
-                "gen_ai.system",
-                "openai",
-            )
-
+            span.set_attribute("gen_ai.system", "anthropic")
             span.set_attribute(
                 "gen_ai.provider.name",
-                "openai",
+                "anthropic",
             )
-
             span.set_attribute(
                 "gen_ai.operation.name",
                 "chat",
             )
-
             span.set_attribute(
                 "gen_ai.request.model",
-                selected_model,
+                MODEL,
             )
-
             span.set_attribute(
                 "gen_ai.response.model",
-                selected_model,
+                MODEL,
             )
-
             span.set_attribute(
                 "gen_ai.usage.input_tokens",
                 input_tokens,
             )
-
             span.set_attribute(
                 "gen_ai.usage.output_tokens",
                 output_tokens,
             )
-
             span.set_attribute(
                 "gen_ai.usage.total_tokens",
                 input_tokens + output_tokens,
+            )
+            span.set_attribute(
+                "agentguard.test_run_id",
+                RUN_ID,
+            )
+            span.set_attribute(
+                "app.feature",
+                feature,
+            )
+            span.set_attribute(
+                "tenant.id",
+                tenant,
             )
 
             if tool_name:
@@ -908,30 +819,23 @@ def create_synthetic_span(
 
             if error_message:
                 error = RuntimeError(error_message)
-
                 span.record_exception(error)
-
                 span.set_attribute(
                     "error.type",
                     type(error).__name__,
                 )
-
                 span.set_attribute(
                     "error.message",
                     error_message,
                 )
-
                 span.set_status(
                     Status(
                         StatusCode.ERROR,
                         error_message,
                     )
                 )
-
             else:
-                span.set_status(
-                    Status(StatusCode.OK)
-                )
+                span.set_status(Status(StatusCode.OK))
 
 
 # ============================================================
@@ -960,18 +864,18 @@ def create_score(
         "source": "API",
         "comment": comment,
         "environment": ENVIRONMENT,
-        "metadata": tenant_metadata(
-            test_case=f"score-{name}",
-            feature="score-storage",
-            tenant=TENANT_ID,
-            extra=metadata,
-        ),
+        "metadata": {
+            "testRunId": RUN_ID,
+            "provider": "anthropic",
+            "model": MODEL,
+            **(metadata or {}),
+        },
     }
 
     if observation_id:
         body["observationId"] = observation_id
 
-    with policy_context(
+    with policy(
         f"score-{name}",
         "score-storage",
         extra_metadata=metadata,
@@ -997,8 +901,9 @@ def create_score(
 
 def wait_for_score(
     score_id: str,
+    timeout: int = POLL_TIMEOUT,
 ) -> Dict[str, Any]:
-    deadline = time.time() + POLL_TIMEOUT
+    deadline = time.time() + timeout
     last_response = None
 
     while time.time() < deadline:
@@ -1041,11 +946,10 @@ def verify_score(
         "Stored score name is incorrect",
     )
 
+    actual_value = float(score.get("value"))
+
     check(
-        abs(
-            float(score.get("value"))
-            - float(expected_value)
-        ) < 0.0001,
+        abs(actual_value - float(expected_value)) < 0.0001,
         "Stored score value is incorrect",
     )
 
@@ -1063,19 +967,18 @@ def verify_score(
 # Observability tests
 # ============================================================
 
-def obs_auto_instrumentation() -> None:
-    answer = call_openai(
+def obs_claude_auto_instrumentation() -> None:
+    answer = call_claude(
         (
-            "Explain AI observability "
+            "Explain the purpose of AI observability "
             "in one short sentence."
         ),
         max_tokens=80,
         test_case="auto-instrumentation",
         feature="observability",
-        tenant=TENANT_ID,
     )
 
-    print("Answer:", answer)
+    print("Claude answer:", answer)
 
 
 def obs_cost_by_model() -> None:
@@ -1087,21 +990,19 @@ def obs_cost_by_model() -> None:
         MODEL_3,
     ]:
         try:
-            answer = call_openai(
+            answer = call_claude(
                 "Reply exactly: MODEL TEST OK",
                 model=selected_model,
                 max_tokens=30,
-                test_case=(
-                    f"cost-model-{selected_model}"
-                ),
+                test_case=f"cost-model-{selected_model}",
                 feature="model-cost",
-                tenant=TENANT_ID,
+                tenant="model-test-tenant",
             )
 
             successful_models.append(selected_model)
             print(selected_model, ":", answer)
 
-        except openai.APIError as error:
+        except anthropic.APIError as error:
             print(
                 "Model unavailable:",
                 selected_model,
@@ -1110,34 +1011,34 @@ def obs_cost_by_model() -> None:
 
     check(
         successful_models,
-        "No configured model was available",
+        "None of the configured Claude models were available",
     )
 
 
 def obs_cost_by_feature() -> None:
-    for feature, input_tokens, output_tokens in [
+    cases = [
         ("classify-intent", 500, 50),
         ("summarize-document", 1500, 200),
         ("customer-support", 800, 120),
-    ]:
+    ]
+
+    for feature, input_tokens, output_tokens in cases:
         create_synthetic_span(
             f"feature-{feature}",
             feature=feature,
-            tenant=TENANT_ID,
+            tenant="feature-test-tenant",
             input_tokens=input_tokens,
             output_tokens=output_tokens,
         )
 
 
 def obs_cost_by_tenant() -> None:
-    tenants = [
-        TENANT_ID,
-        f"{TENANT_ID}-customer-a",
-        f"{TENANT_ID}-customer-b",
-    ]
-
-    for tenant in tenants:
-        answer = call_openai(
+    for tenant in [
+        "actaclad-corp",
+        "aanseaa-inc",
+        "agentguard-ltd",
+    ]:
+        answer = call_claude(
             f"Reply exactly: {tenant.upper()} OK",
             max_tokens=30,
             test_case=f"tenant-{tenant}",
@@ -1149,7 +1050,7 @@ def obs_cost_by_tenant() -> None:
 
 
 def obs_trace_errors() -> None:
-    for name, message in [
+    cases = [
         (
             "trace-error-validation",
             "Customer ID is missing",
@@ -1160,13 +1061,15 @@ def obs_trace_errors() -> None:
         ),
         (
             "trace-error-dependency",
-            "Inventory service unavailable",
+            "Inventory service is unavailable",
         ),
-    ]:
+    ]
+
+    for name, message in cases:
         create_synthetic_span(
             name,
             feature="trace-error-testing",
-            tenant=TENANT_ID,
+            tenant="trace-error-tenant",
             error_message=message,
         )
 
@@ -1180,18 +1083,13 @@ def obs_spans() -> None:
         create_synthetic_span(
             name,
             feature="span-test",
-            tenant=TENANT_ID,
+            tenant="span-test-tenant",
             duration=duration,
         )
 
 
 def obs_tools() -> None:
-    for (
-        name,
-        tool_name,
-        arguments,
-        result,
-    ) in [
+    cases = [
         (
             "weather-search",
             "weather_search",
@@ -1210,11 +1108,18 @@ def obs_tools() -> None:
             '{"expression":"125 * 1.18"}',
             '{"value":147.5}',
         ),
-    ]:
+    ]
+
+    for (
+        name,
+        tool_name,
+        arguments,
+        result,
+    ) in cases:
         create_synthetic_span(
             name,
             feature="tool-test",
-            tenant=TENANT_ID,
+            tenant="tool-test-tenant",
             tool_name=tool_name,
             tool_arguments=arguments,
             tool_result=result,
@@ -1225,7 +1130,7 @@ def obs_error_observations() -> None:
     for name, message in [
         (
             "json-parser-error",
-            "Invalid JSON returned by model",
+            "Invalid JSON returned by the model",
         ),
         (
             "tool-execution-error",
@@ -1233,13 +1138,13 @@ def obs_error_observations() -> None:
         ),
         (
             "output-validation-error",
-            "Required field answer is missing",
+            "Required field 'answer' is missing",
         ),
     ]:
         create_synthetic_span(
             name,
             feature="error-testing",
-            tenant=TENANT_ID,
+            tenant="error-test-tenant",
             error_message=message,
         )
 
@@ -1253,7 +1158,7 @@ def obs_latency() -> None:
         create_synthetic_span(
             name,
             feature="latency-test",
-            tenant=TENANT_ID,
+            tenant="latency-test-tenant",
             duration=duration,
         )
 
@@ -1267,6 +1172,7 @@ def create_prompt(
     content: str,
     *,
     labels: List[str],
+    tags: List[str],
     commit_message: str,
 ) -> Dict[str, Any]:
     response = rest(
@@ -1278,13 +1184,9 @@ def create_prompt(
             "type": "text",
             "prompt": content,
             "labels": labels,
-            "tags": [
-                "automated-test",
-                "openai",
-                PROJECT_NAME,
-            ],
+            "tags": tags,
             "config": {
-                "provider": "openai",
+                "provider": "anthropic",
                 "model": MODEL,
                 "temperature": 0,
             },
@@ -1296,7 +1198,7 @@ def create_prompt(
 
     check(
         result,
-        "Prompt creation returned empty response",
+        f"Prompt {name} returned an empty response",
     )
 
     return result
@@ -1334,7 +1236,7 @@ def prompt_creation() -> None:
         "Answer this question: {{question}}"
     )
 
-    with policy_context(
+    with policy(
         "prompt-creation",
         "prompt-management",
     ):
@@ -1342,7 +1244,11 @@ def prompt_creation() -> None:
             PROMPT_CREATION_NAME,
             content,
             labels=["prompt-creation-test"],
-            commit_message="Initial prompt",
+            tags=[
+                "automated-test",
+                "prompt-management",
+            ],
+            commit_message="Created by unified API test",
         )
 
         version = int(created.get("version", 1))
@@ -1355,7 +1261,7 @@ def prompt_creation() -> None:
     check_equal(
         retrieved.get("prompt"),
         content,
-        "Prompt content is incorrect",
+        "Retrieved prompt content is incorrect",
     )
 
     print("Prompt :", PROMPT_CREATION_NAME)
@@ -1370,10 +1276,11 @@ def prompt_versioning() -> None:
 
     content_v2 = (
         "Classify this message as billing, technical, "
-        "account, or other: {{customer_message}}"
+        "account, or other. Return only the category: "
+        "{{customer_message}}"
     )
 
-    with policy_context(
+    with policy(
         "prompt-versioning",
         "prompt-management",
     ):
@@ -1381,6 +1288,7 @@ def prompt_versioning() -> None:
             PROMPT_VERSION_NAME,
             content_v1,
             labels=["development"],
+            tags=["automated-test", "versioning"],
             commit_message="Initial version",
         )
 
@@ -1388,20 +1296,24 @@ def prompt_versioning() -> None:
             PROMPT_VERSION_NAME,
             content_v2,
             labels=["development", "production"],
+            tags=["automated-test", "versioning"],
             commit_message="Improved version",
         )
 
-        number_1 = int(
+        version_1_number = int(
             version_1.get("version", 1)
         )
 
-        number_2 = int(
-            version_2.get("version", number_1 + 1)
+        version_2_number = int(
+            version_2.get(
+                "version",
+                version_1_number + 1,
+            )
         )
 
         retrieved_v1 = get_prompt(
             PROMPT_VERSION_NAME,
-            version=number_1,
+            version=version_1_number,
         )
 
         production = get_prompt(
@@ -1410,8 +1322,8 @@ def prompt_versioning() -> None:
         )
 
     check_equal(
-        number_2,
-        number_1 + 1,
+        version_2_number,
+        version_1_number + 1,
         "Prompt version did not increment",
     )
 
@@ -1424,11 +1336,11 @@ def prompt_versioning() -> None:
     check_equal(
         production.get("prompt"),
         content_v2,
-        "Production prompt is incorrect",
+        "Production prompt content is incorrect",
     )
 
-    print("Version 1:", number_1)
-    print("Version 2:", number_2)
+    print("Version 1:", version_1_number)
+    print("Version 2:", version_2_number)
 
 
 def create_dataset(
@@ -1443,11 +1355,11 @@ def create_dataset(
             body={
                 "name": name,
                 "description": description,
-                "metadata": tenant_metadata(
-                    test_case="dataset-create",
-                    feature="dataset",
-                    tenant=TENANT_ID,
-                ),
+                "metadata": {
+                    "testRunId": RUN_ID,
+                    "provider": "anthropic",
+                    "model": MODEL,
+                },
             },
         )
     )
@@ -1472,13 +1384,11 @@ def create_dataset_item(
                 "datasetName": dataset_name,
                 "input": input_data,
                 "expectedOutput": expected_output,
+                "metadata": {
+                    "testRunId": RUN_ID,
+                    **(metadata or {}),
+                },
                 "status": "ACTIVE",
-                "metadata": tenant_metadata(
-                    test_case="dataset-item",
-                    feature="dataset",
-                    tenant=TENANT_ID,
-                    extra=metadata,
-                ),
             },
         )
     )
@@ -1507,25 +1417,25 @@ def get_dataset_items(
 
 
 def prompt_dataset() -> None:
-    with policy_context(
+    with policy(
         "prompt-dataset",
         "prompt-management",
     ):
         dataset = create_dataset(
             PROMPT_DATASET_NAME,
-            "Prompt-management dataset",
+            "Prompt-management test dataset",
         )
 
-        item = create_dataset_item(
+        dataset_item = create_dataset_item(
             PROMPT_DATASET_NAME,
             {
-                "question": (
-                    "How can I reset my password?"
-                )
+                "question": "How can I reset my password?",
+                "customerType": "premium",
             },
             {
                 "answer": (
-                    "Open settings and select Reset password."
+                    "Open account settings and select "
+                    "Reset password."
                 )
             },
             metadata={
@@ -1539,19 +1449,19 @@ def prompt_dataset() -> None:
 
     check(
         any(
-            str(stored.get("id"))
-            == str(item.get("id"))
-            for stored in items
+            str(item.get("id"))
+            == str(dataset_item.get("id"))
+            for item in items
         ),
-        "Prompt dataset item was not stored",
+        "Prompt dataset item was not persisted",
     )
 
-    print("Dataset ID:", dataset.get("id"))
-    print("Item ID   :", item.get("id"))
+    print("Dataset ID     :", dataset.get("id"))
+    print("Dataset item ID:", dataset_item.get("id"))
 
 
 # ============================================================
-# Evaluation
+# Evaluation tests
 # ============================================================
 
 def score_storage() -> None:
@@ -1563,21 +1473,21 @@ def score_storage() -> None:
         feature="score-storage",
     )
 
-    name = f"answer-quality-{SHORT_ID}"
-    value = 0.87
+    score_name = f"answer-quality-{SHORT_ID}"
+    score_value = 0.87
 
     score_id = create_score(
-        name,
-        value,
+        score_name,
+        score_value,
         trace_id=trace_data["traceId"],
         observation_id=trace_data["observationId"],
-        comment="Score storage test",
+        comment="Unified AgentGuard score-storage test",
     )
 
     verify_score(
         score_id,
-        name,
-        value,
+        score_name,
+        score_value,
         trace_data["traceId"],
     )
 
@@ -1591,21 +1501,24 @@ def controlled_llm_judge() -> None:
     )
 
     good_answer = (
-        "Confirm the duplicate charge, refund it, "
-        "and provide a settlement estimate."
+        "Confirm the duplicate charge, refund the extra "
+        "charge, and provide a settlement estimate."
     )
 
     bad_answer = (
-        "Tell the customer duplicate charges "
-        "cannot be refunded."
+        "Tell the customer duplicate charges cannot "
+        "be refunded."
     )
 
     judgment = call_json_judge(
         (
-            "Evaluate both answers. Return JSON exactly as "
+            "Evaluate the good and bad answers. "
+            "Return a JSON object exactly in this shape: "
             '{"good":{"score":0.0,"reason":"text"},'
             '"bad":{"score":0.0,"reason":"text"}}. '
-            "Scores must be between 0 and 1."
+            "Scores must be between 0 and 1. "
+            "The correct answer must score high and the "
+            "incorrect answer must score low."
         ),
         {
             "request": request,
@@ -1637,6 +1550,11 @@ def controlled_llm_judge() -> None:
         f"Bad answer scored too high: {bad_score}",
     )
 
+    check(
+        good_score > bad_score,
+        "Judge did not discriminate between answers",
+    )
+
     trace_data = create_trace(
         "controlled-llm-judge",
         {"request": request},
@@ -1646,6 +1564,10 @@ def controlled_llm_judge() -> None:
         },
         test_case="controlled-judge",
         feature="llm-as-judge",
+        metadata={
+            "judgeProvider": "anthropic",
+            "judgeModel": MODEL,
+        },
     )
 
     score_id = create_score(
@@ -1657,7 +1579,7 @@ def controlled_llm_judge() -> None:
             judgment["good"]["reason"]
         ),
         metadata={
-            "judgeProvider": "openai",
+            "judgeProvider": "anthropic",
             "judgeModel": MODEL,
             "badScore": bad_score,
         },
@@ -1670,41 +1592,54 @@ def controlled_llm_judge() -> None:
         trace_data["traceId"],
     )
 
-    print("Good:", good_score)
-    print("Bad :", bad_score)
+    print("Good score:", good_score)
+    print("Bad score :", bad_score)
 
 
 def evaluator_panel() -> None:
     criteria = {
-        "Correctness": "Is the answer correct?",
-        "Helpfulness": "Is the answer helpful?",
-        "Conciseness": "Is it concise?",
+        "Correctness": (
+            "Is the answer factually correct?"
+        ),
+        "Helpfulness": (
+            "Is the answer useful and actionable?"
+        ),
+        "Conciseness": (
+            "Is the answer appropriately concise?"
+        ),
         "Hallucination": (
-            "Score 1 for no unsupported claims."
+            "Score 1 when there are no unsupported claims "
+            "and 0 for severe hallucination."
         ),
         "Context Relevance": (
-            "Is it relevant to the context?"
+            "Is the answer relevant to the supplied context?"
         ),
     }
 
+    request = (
+        "How should support handle a duplicate charge?"
+    )
+
     context = (
-        "Duplicate charges are refundable within "
-        "2-3 business days."
+        "Duplicate charges are refundable to the original "
+        "payment method within 2-3 business days."
     )
 
     answer = (
-        "Refund the duplicate charge and explain "
-        "the 2-3 business day settlement."
+        "Refund the duplicate charge to the original payment "
+        "method and explain the 2-3 business day settlement."
     )
 
     result = call_json_judge(
         (
-            "Evaluate all five criteria from 0 to 1. "
-            "Return JSON as "
+            "Evaluate all five supplied criteria from 0 to 1. "
+            "For Hallucination, 1 means no hallucination. "
+            "Return only a JSON object in this shape: "
             '{"evaluations":{"Criterion":'
             '{"score":0.0,"reason":"text"}}}.'
         ),
         {
+            "request": request,
             "context": context,
             "answer": answer,
             "criteria": criteria,
@@ -1717,18 +1652,24 @@ def evaluator_panel() -> None:
 
     check(
         isinstance(evaluations, dict),
-        "Evaluations were not returned",
+        "Judge did not return evaluations",
     )
 
     trace_data = create_trace(
         "external-evaluator-panel",
-        {"context": context},
+        {
+            "request": request,
+            "context": context,
+        },
         {
             "answer": answer,
             "evaluations": evaluations,
         },
         test_case="evaluator-panel",
         feature="external-evaluator-panel",
+        metadata={
+            "judgeModel": MODEL,
+        },
     )
 
     for name in criteria:
@@ -1737,32 +1678,28 @@ def evaluator_panel() -> None:
             f"Missing evaluator: {name}",
         )
 
-        score = float(
-            evaluations[name]["score"]
-        )
+        evaluation = evaluations[name]
+        score = float(evaluation["score"])
 
         check_score(score, name)
 
-        score_name = f"OpenAI {name}"
-
         score_id = create_score(
-            score_name,
+            name,
             score,
             trace_id=trace_data["traceId"],
             observation_id=trace_data["observationId"],
-            comment=str(
-                evaluations[name]["reason"]
-            ),
+            comment=str(evaluation["reason"]),
             metadata={
-                "criterion": name,
-                "judgeProvider": "openai",
+                "judgeProvider": "anthropic",
                 "judgeModel": MODEL,
+                "evaluatorType": "external",
+                "criterion": name,
             },
         )
 
         verify_score(
             score_id,
-            score_name,
+            name,
             score,
             trace_data["traceId"],
         )
@@ -1775,31 +1712,38 @@ def evaluator_panel() -> None:
 # ============================================================
 
 def human_review() -> None:
-    with policy_context(
+    config_name = f"HR Quality {SHORT_ID}"
+    queue_name = f"HR Queue {SHORT_ID}"
+
+    with policy(
         "human-review",
         "human-review",
     ):
-        config = unwrap_object(
+        score_config = unwrap_object(
             rest(
                 "POST",
                 "/api/public/score-configs",
                 expected=(200, 201),
                 body={
-                    "name": (
-                        f"HR Quality {SHORT_ID}"
-                    ),
+                    "name": config_name,
                     "dataType": "NUMERIC",
                     "minValue": 0,
                     "maxValue": 1,
+                    "description": (
+                        "Human-review score created by "
+                        "the unified API test"
+                    ),
                 },
             )
         )
 
-        config_id = response_id(config)
+        score_config_id = response_id(
+            score_config
+        )
 
         check(
-            config_id,
-            "Score config did not return ID",
+            score_config_id,
+            "Score configuration did not return an ID",
         )
 
         queue = unwrap_object(
@@ -1808,12 +1752,12 @@ def human_review() -> None:
                 "/api/public/annotation-queues",
                 expected=(200, 201),
                 body={
-                    "name": f"HR Queue {SHORT_ID}",
+                    "name": queue_name,
                     "description": (
-                        "Human review for test-evals"
+                        "Unified Python human-review queue"
                     ),
                     "scoreConfigIds": [
-                        config_id,
+                        score_config_id,
                     ],
                 },
             )
@@ -1823,7 +1767,7 @@ def human_review() -> None:
 
         check(
             queue_id,
-            "Queue did not return ID",
+            "Annotation queue did not return an ID",
         )
 
     trace_data = create_trace(
@@ -1835,15 +1779,18 @@ def human_review() -> None:
         },
         {
             "answer": (
-                "Open Settings and select Billing."
+                "Open account settings and select Billing."
             )
         },
         test_case="human-review",
         feature="human-review",
+        metadata={
+            "manualReviewRequired": True,
+        },
     )
 
-    with policy_context(
-        "human-review-item",
+    with policy(
+        "human-review-queue-item",
         "human-review",
     ):
         item = rest(
@@ -1862,16 +1809,22 @@ def human_review() -> None:
 
     print("Queue ID:", queue_id)
     print("Item ID :", response_id(item))
-    print("Complete the review manually in the UI")
+    print(
+        "Status  : PENDING - complete the review manually "
+        "in AI Quality > Human Review"
+    )
 
 
 # ============================================================
-# Dataset Experiment
+# Dataset experiment
 # ============================================================
 
-def create_run_item(
+def create_dataset_run_item(
+    *,
     dataset_item_id: str,
-    trace_data: Dict[str, str],
+    trace_id: str,
+    observation_id: str,
+    run_name: str,
 ) -> Dict[str, Any]:
     return unwrap_object(
         rest(
@@ -1879,36 +1832,36 @@ def create_run_item(
             "/api/public/dataset-run-items",
             expected=(200, 201),
             body={
-                "runName": EXPERIMENT_NAME,
+                "runName": run_name,
                 "runDescription": (
-                    "OpenAI test-evals experiment"
+                    "Unified AgentGuard evaluation experiment"
                 ),
                 "datasetItemId": dataset_item_id,
-                "traceId": trace_data["traceId"],
-                "observationId": (
-                    trace_data["observationId"]
-                ),
+                "traceId": trace_id,
+                "observationId": observation_id,
                 "createdAt": utc_now(),
-                "metadata": tenant_metadata(
-                    test_case="experiment-run-item",
-                    feature="dataset-experiment",
-                    tenant=TENANT_ID,
-                ),
+                "metadata": {
+                    "testRunId": RUN_ID,
+                    "provider": "anthropic",
+                    "model": MODEL,
+                },
             },
         )
     )
 
 
 def wait_for_run(
+    dataset_name: str,
+    run_name: str,
     expected_count: int,
 ) -> Dict[str, Any]:
-    dataset_name = quote(
-        EVALUATION_DATASET_NAME,
+    encoded_dataset = quote(
+        dataset_name,
         safe="",
     )
 
-    run_name = quote(
-        EXPERIMENT_NAME,
+    encoded_run = quote(
+        run_name,
         safe="",
     )
 
@@ -1918,90 +1871,112 @@ def wait_for_run(
     while time.time() < deadline:
         response = rest_client.get(
             (
-                f"/api/public/datasets/{dataset_name}"
-                f"/runs/{run_name}"
+                "/api/public/datasets/"
+                f"{encoded_dataset}/runs/{encoded_run}"
             )
         )
 
         if response.status_code == 200:
             last_response = response.json()
-            run = unwrap_object(last_response)
+            result = unwrap_object(last_response)
 
-            if len(
-                run.get("datasetRunItems", [])
-            ) >= expected_count:
-                return run
+            run_items = result.get(
+                "datasetRunItems",
+                [],
+            )
+
+            if len(run_items) >= expected_count:
+                return result
 
         time.sleep(POLL_INTERVAL)
 
     raise AssertionError(
-        "Experiment was not visible. "
+        "Experiment run was not visible. "
         f"Last response: {last_response}"
     )
 
 
 def dataset_experiment() -> None:
-    dataset = create_dataset(
-        EVALUATION_DATASET_NAME,
-        "OpenAI test-evals experiment",
-    )
-
-    cases = [
-        {
-            "input": {
-                "question": (
-                    "What is the capital of France?"
-                ),
-                "context": (
-                    "The capital of France is Paris."
-                ),
-            },
-            "expected": {
-                "answer": "Paris",
-            },
-        },
-        {
-            "input": {
-                "question": (
-                    "Which planet is the Red Planet?"
-                ),
-                "context": (
-                    "Mars is the Red Planet."
-                ),
-            },
-            "expected": {
-                "answer": "Mars",
-            },
-        },
-    ]
-
-    items = []
-
-    for case in cases:
-        created = create_dataset_item(
+    with policy(
+        "dataset-creation",
+        "dataset-experiment",
+    ):
+        dataset = create_dataset(
             EVALUATION_DATASET_NAME,
-            case["input"],
-            case["expected"],
-            metadata={
-                "experimentName": EXPERIMENT_NAME,
-            },
+            "Unified AgentGuard evaluation experiment",
         )
 
-        items.append(
+        cases = [
             {
-                **case,
-                "id": created["id"],
-            }
+                "input": {
+                    "question": (
+                        "What is the capital of France?"
+                    ),
+                    "context": (
+                        "The capital of France is Paris."
+                    ),
+                },
+                "expected": {
+                    "answer": "Paris",
+                },
+            },
+            {
+                "input": {
+                    "question": (
+                        "Which planet is the Red Planet?"
+                    ),
+                    "context": (
+                        "Mars is called the Red Planet."
+                    ),
+                },
+                "expected": {
+                    "answer": "Mars",
+                },
+            },
+        ]
+
+        items = []
+
+        for case in cases:
+            created = create_dataset_item(
+                EVALUATION_DATASET_NAME,
+                case["input"],
+                case["expected"],
+                metadata={
+                    "experimentName": EXPERIMENT_NAME,
+                },
+            )
+
+            items.append(
+                {
+                    **case,
+                    "id": created["id"],
+                }
+            )
+
+        stored_items = get_dataset_items(
+            EVALUATION_DATASET_NAME
         )
 
-    run_ids = []
-    score_checks = []
+    stored_ids = {
+        str(item.get("id"))
+        for item in stored_items
+    }
+
+    for item in items:
+        check(
+            str(item["id"]) in stored_ids,
+            f"Dataset item was not persisted: {item['id']}",
+        )
+
+    run_item_ids = []
+    scores = []
 
     for number, item in enumerate(
         items,
         start=1,
     ):
-        output = call_openai(
+        output = call_claude(
             (
                 f"Context:\n"
                 f"{item['input']['context']}\n\n"
@@ -2009,7 +1984,8 @@ def dataset_experiment() -> None:
                 f"{item['input']['question']}"
             ),
             system=(
-                "Answer using only the context."
+                "Answer using only the supplied context. "
+                "Be concise."
             ),
             max_tokens=100,
             test_case=f"experiment-{number}",
@@ -2026,43 +2002,50 @@ def dataset_experiment() -> None:
             test_case=f"experiment-{number}",
             feature="dataset-experiment",
             metadata={
-                "datasetName": (
-                    EVALUATION_DATASET_NAME
-                ),
+                "datasetName": EVALUATION_DATASET_NAME,
                 "datasetItemId": item["id"],
                 "experimentName": EXPERIMENT_NAME,
             },
         )
 
-        run_item = create_run_item(
-            item["id"],
-            trace_data,
-        )
+        with policy(
+            f"experiment-run-item-{number}",
+            "dataset-experiment",
+        ):
+            run_item = create_dataset_run_item(
+                dataset_item_id=item["id"],
+                trace_id=trace_data["traceId"],
+                observation_id=(
+                    trace_data["observationId"]
+                ),
+                run_name=EXPERIMENT_NAME,
+            )
 
-        run_id = response_id(run_item)
+        run_item_id = response_id(run_item)
 
         check(
-            run_id,
-            "Run item did not return ID",
+            run_item_id,
+            "Dataset run item did not return an ID",
         )
 
-        run_ids.append(run_id)
+        run_item_ids.append(run_item_id)
 
-        expected = (
+        expected_answer = (
             item["expected"]["answer"].lower()
         )
 
         accuracy = (
             1.0
-            if expected in output.lower()
+            if expected_answer in output.lower()
             else 0.0
         )
 
         judgment = call_json_judge(
             (
-                "Compare actual and expected answers. "
-                "Return JSON exactly as "
-                '{"score":0.0,"reason":"text"}.'
+                "Compare the actual and expected answers. "
+                "Return only a JSON object exactly as "
+                '{"score":0.0,"reason":"text"}. '
+                "The score must be between 0 and 1."
             ),
             {
                 "input": item["input"],
@@ -2086,7 +2069,7 @@ def dataset_experiment() -> None:
             (
                 "Experiment Accuracy",
                 accuracy,
-                "Expected-answer check",
+                "Deterministic expected-answer check",
             ),
             (
                 "Experiment LLM Judge",
@@ -2106,12 +2089,17 @@ def dataset_experiment() -> None:
                     "datasetName": (
                         EVALUATION_DATASET_NAME
                     ),
+                    "experimentName": (
+                        EXPERIMENT_NAME
+                    ),
                     "datasetItemId": item["id"],
-                    "experimentName": EXPERIMENT_NAME,
+                    "datasetRunId": (
+                        run_item.get("datasetRunId")
+                    ),
                 },
             )
 
-            score_checks.append(
+            scores.append(
                 (
                     score_id,
                     name,
@@ -2121,15 +2109,39 @@ def dataset_experiment() -> None:
             )
 
     stored_run = wait_for_run(
-        len(items)
+        EVALUATION_DATASET_NAME,
+        EXPERIMENT_NAME,
+        len(items),
     )
+
+    stored_run_items = stored_run.get(
+        "datasetRunItems",
+        [],
+    )
+
+    check_equal(
+        len(stored_run_items),
+        len(items),
+        "Experiment has the wrong item count",
+    )
+
+    stored_run_ids = {
+        str(item.get("id"))
+        for item in stored_run_items
+    }
+
+    for run_item_id in run_item_ids:
+        check(
+            str(run_item_id) in stored_run_ids,
+            f"Run item missing: {run_item_id}",
+        )
 
     for (
         score_id,
         name,
         value,
         trace_id,
-    ) in score_checks:
+    ) in scores:
         verify_score(
             score_id,
             name,
@@ -2139,7 +2151,7 @@ def dataset_experiment() -> None:
 
     print("Dataset ID:", dataset.get("id"))
     print("Run ID    :", stored_run.get("id"))
-    print("Run items :", len(run_ids))
+    print("Run items :", len(stored_run_items))
 
 
 # ============================================================
@@ -2147,7 +2159,7 @@ def dataset_experiment() -> None:
 # ============================================================
 
 def print_summary() -> bool:
-    section("TEST SUMMARY")
+    section("UNIFIED AGENTGUARD TEST SUMMARY")
 
     for result in TEST_RESULTS:
         print(
@@ -2158,29 +2170,37 @@ def print_summary() -> bool:
         )
 
     passed = sum(
-        result["status"] == "PASS"
-        for result in TEST_RESULTS
+        item["status"] == "PASS"
+        for item in TEST_RESULTS
     )
 
     failed = sum(
-        result["status"] == "FAIL"
-        for result in TEST_RESULTS
+        item["status"] == "FAIL"
+        for item in TEST_RESULTS
     )
 
     skipped = sum(
-        result["status"] == "SKIP"
-        for result in TEST_RESULTS
+        item["status"] == "SKIP"
+        for item in TEST_RESULTS
     )
 
     print("-" * 76)
-    print("Total      :", len(TEST_RESULTS))
-    print("Passed     :", passed)
-    print("Failed     :", failed)
-    print("Skipped    :", skipped)
-    print("Project    :", PROJECT_NAME)
-    print("Project ID :", PROJECT_ID)
-    print("Tenant ID  :", TENANT_ID)
-    print("Run ID     :", RUN_ID)
+    print("Total  :", len(TEST_RESULTS))
+    print("Passed :", passed)
+    print("Failed :", failed)
+    print("Skipped:", skipped)
+    print("Run ID :", RUN_ID)
+
+    print("\nUI locations:")
+    print("- Traces: Observability")
+    print("- Prompts: Prompt Management")
+    print("- Scores: AI Quality > Scores")
+    print("- Human Review: AI Quality > Human Review")
+    print("- Datasets: AI Quality > Datasets")
+    print(
+        "- External judge results appear under Scores; "
+        "they do not create native evaluator definitions."
+    )
 
     return failed == 0
 
@@ -2190,14 +2210,13 @@ def print_summary() -> bool:
 # ============================================================
 
 def main() -> int:
-    section("AGENTGUARD OPENAI TEST")
+    section("AGENTGUARD INIT + POLICY TEST SUITE")
 
-    print("Organization:", "Agent Guard Org")
-    print("Project     :", PROJECT_NAME)
-    print("Project ID  :", PROJECT_ID)
-    print("Tenant ID   :", TENANT_ID)
-    print("Model       :", MODEL)
-    print("Run ID      :", RUN_ID)
+    print("Base URL   :", BASE_URL)
+    print("Project ID :", PROJECT_ID)
+    print("Model      :", MODEL)
+    print("Environment:", ENVIRONMENT)
+    print("Run ID     :", RUN_ID)
 
     run_test(
         "Setup",
@@ -2208,11 +2227,11 @@ def main() -> int:
 
     section("OBSERVABILITY")
 
-    for test_id, name, function in [
+    observability_tests = [
         (
             "OBS-01",
-            "Automatic instrumentation",
-            obs_auto_instrumentation,
+            "Claude automatic instrumentation",
+            obs_claude_auto_instrumentation,
         ),
         (
             "OBS-02",
@@ -2236,12 +2255,12 @@ def main() -> int:
         ),
         (
             "OBS-06",
-            "Spans",
+            "Span observations",
             obs_spans,
         ),
         (
             "OBS-07",
-            "Tools",
+            "Tool observations",
             obs_tools,
         ),
         (
@@ -2251,10 +2270,12 @@ def main() -> int:
         ),
         (
             "OBS-09",
-            "Latency",
+            "Latency observations",
             obs_latency,
         ),
-    ]:
+    ]
+
+    for test_id, name, function in observability_tests:
         run_test(
             "Observability",
             test_id,
@@ -2264,7 +2285,7 @@ def main() -> int:
 
     section("PROMPT MANAGEMENT")
 
-    for test_id, name, function in [
+    prompt_tests = [
         (
             "PROMPT-01",
             "Prompt creation",
@@ -2280,7 +2301,9 @@ def main() -> int:
             "Prompt dataset",
             prompt_dataset,
         ),
-    ]:
+    ]
+
+    for test_id, name, function in prompt_tests:
         run_test(
             "Prompts",
             test_id,
@@ -2290,33 +2313,35 @@ def main() -> int:
 
     section("EVALUATION")
 
-    for test_id, name, function in [
+    evaluation_tests = [
         (
             "EVAL-01",
-            "Score storage",
+            "Score storage and retrieval",
             score_storage,
         ),
         (
             "EVAL-02",
-            "LLM-as-a-Judge",
+            "Controlled LLM-as-a-Judge",
             controlled_llm_judge,
         ),
         (
             "EVAL-03",
-            "Five evaluators",
+            "Five evaluator criteria",
             evaluator_panel,
         ),
         (
             "EVAL-04",
-            "Human review",
+            "Human review queue",
             human_review,
         ),
         (
             "DATA-01",
-            "Dataset experiment",
+            "Dataset and experiment",
             dataset_experiment,
         ),
-    ]:
+    ]
+
+    for test_id, name, function in evaluation_tests:
         run_test(
             "Evaluation",
             test_id,
@@ -2325,9 +2350,9 @@ def main() -> int:
         )
 
     try:
-        agentguard.flush()
+        flush()
     except Exception as error:
-        print("Flush warning:", error)
+        print("AgentGuard flush warning:", error)
 
     success = print_summary()
 
@@ -2345,7 +2370,7 @@ if __name__ == "__main__":
             pass
 
         try:
-            openai_client.close()
+            claude_client.close()
         except Exception:
             pass
 
